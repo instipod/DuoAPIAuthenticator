@@ -1,6 +1,8 @@
 # DuoAPIAuthenticator
 Authenticator for [Keycloak](https://github.com/keycloak/keycloak) that uses Duo's Auth API to present a custom interface.  This allows the Keycloak administrator to create a custom authentication theme that fits with their flow.  
 
+The included FreeMarker templates are not designed for production use.  They are designed to be a basic example that you will extend with a custom Keycloak theme.
+
 ## Build
 Make sure you have the [DuoAPIJavaClient](https://github.com/instipod/DuoAPIJavaClient) library imported into your local Maven repository.  After that, you should be able to build and package using Maven.  You will need to use the output JAR that includes dependencies as otherwise Keycloak won't be able to find the embedded libraries.
 
