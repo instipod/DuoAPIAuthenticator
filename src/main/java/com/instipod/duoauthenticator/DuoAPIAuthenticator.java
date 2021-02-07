@@ -11,7 +11,6 @@ import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserModel;
 
-import javax.ws.rs.core.MultivaluedHashMap;
 import javax.ws.rs.core.MultivaluedMap;
 import javax.ws.rs.core.Response;
 import java.time.Instant;
@@ -24,8 +23,62 @@ public class DuoAPIAuthenticator implements Authenticator {
         return apiObject;
     }
 
+    private void challengePushForm(AuthenticationFlowContext authenticationFlowContext, String error) {
+        LoginFormsProvider form = authenticationFlowContext.form();
+        if (error != null) {
+            form = form.setError(error);
+            form = form.setAttribute("autorefresh", false);
+            form = form.setAttribute("problem", error);
+        } else {
+            form = form.setAttribute("autorefresh", true);
+            form = form.setAttribute("problem", "none");
+        }
+        Response response = form.createForm("duo-push.ftl");
+        if (error != null) {
+            authenticationFlowContext.failureChallenge(AuthenticationFlowError.INVALID_CREDENTIALS, response);
+        } else {
+            authenticationFlowContext.challenge(response);
+        }
+    }
+
+    private void challengePushForm(AuthenticationFlowContext authenticationFlowContext) {
+        challengePushForm(authenticationFlowContext, null);
+    }
+
+    private void challengeCodeForm(AuthenticationFlowContext authenticationFlowContext, String capability, String error) {
+        LoginFormsProvider form = authenticationFlowContext.form();
+        form = form.setAttribute("capability", capability);
+        if (error != null) {
+            form = form.setError(error);
+        }
+        Response response = form.createForm("duo-code.ftl");
+        if (error != null) {
+            authenticationFlowContext.failureChallenge(AuthenticationFlowError.INVALID_CREDENTIALS, response);
+        } else {
+            authenticationFlowContext.challenge(response);
+        }
+    }
+
+    private void challengeCodeForm(AuthenticationFlowContext authenticationFlowContext, String capability) {
+        challengeCodeForm(authenticationFlowContext, capability, null);
+    }
+
     @Override
     public void authenticate(AuthenticationFlowContext authenticationFlowContext) {
+        AuthenticatorConfigModel config = authenticationFlowContext.getAuthenticatorConfig();
+        if (config.getConfig().getOrDefault(DuoAPIAuthenticatorFactory.DUO_API_HOSTNAME, "none").equalsIgnoreCase("none")) {
+            //authenticator not configured
+            authenticationFlowContext.failure(AuthenticationFlowError.INTERNAL_ERROR);
+        }
+        if (config.getConfig().getOrDefault(DuoAPIAuthenticatorFactory.DUO_INTEGRATION_KEY, "none").equalsIgnoreCase("none")) {
+            //authenticator not configured
+            authenticationFlowContext.failure(AuthenticationFlowError.INTERNAL_ERROR);
+        }
+        if (config.getConfig().getOrDefault(DuoAPIAuthenticatorFactory.DUO_SECRET_KEY, "none").equalsIgnoreCase("none")) {
+            //authenticator not configured
+            authenticationFlowContext.failure(AuthenticationFlowError.INTERNAL_ERROR);
+        }
+
         DuoAPIObject duo = getDuoObject(authenticationFlowContext.getAuthenticatorConfig());
 
         DuoUser duoUser = duo.getUser(authenticationFlowContext.getUser().getUsername(), authenticationFlowContext.getConnection().getRemoteAddr());
@@ -44,9 +97,7 @@ public class DuoAPIAuthenticator implements Authenticator {
             //enroll the user
             if (duoUser.canEnrollHere()) {
                 LoginFormsProvider form = authenticationFlowContext.form();
-                MultivaluedHashMap<String, String> formData = new MultivaluedHashMap<String, String>();
-                formData.add("duo-enroll", duoUser.getEnrollURL());
-                Response response = form.setFormData(formData).createForm("duo-enroll.ftl");
+                Response response = form.setAttribute("enrollUrl", duoUser.getEnrollURL()).createForm("duo-enroll.ftl");
                 authenticationFlowContext.challenge(response);
                 return;
             } else {
@@ -68,9 +119,7 @@ public class DuoAPIAuthenticator implements Authenticator {
             authenticationFlowContext.getAuthenticationSession().setAuthNote("duo-method", "push");
             authenticationFlowContext.getAuthenticationSession().setAuthNote("duo-send-time", Long.toString(Instant.now().getEpochSecond()));
             authenticationFlowContext.getAuthenticationSession().setAuthNote("duo-transaction", transaction.getTransactionIdentifier());
-            LoginFormsProvider form = authenticationFlowContext.form();
-            Response response = form.createForm("duo-push.ftl");
-            authenticationFlowContext.challenge(response);
+            challengePushForm(authenticationFlowContext);
             return;
         } else if (device != null && device instanceof DuoCodeCapableDevice) {
             DuoCodeCapableDevice codeDevice = (DuoCodeCapableDevice)device;
@@ -78,11 +127,7 @@ public class DuoAPIAuthenticator implements Authenticator {
             authenticationFlowContext.getAuthenticationSession().setAuthNote("duo-method", "code");
             authenticationFlowContext.getAuthenticationSession().setAuthNote("duo-device", device.getDeviceIdentifier());
             authenticationFlowContext.getAuthenticationSession().setAuthNote("duo-capability", device.getCapabilityIdentifier());
-            LoginFormsProvider form = authenticationFlowContext.form();
-            MultivaluedHashMap<String, String> formData = new MultivaluedHashMap<String, String>();
-            formData.add("duo-capability", device.getCapabilityIdentifier());
-            Response response = form.setFormData(formData).createForm("duo-code.ftl");
-            authenticationFlowContext.challenge(response);
+            challengeCodeForm(authenticationFlowContext, device.getCapabilityIdentifier());
             return;
         } else {
             //unsupported device type or no device
@@ -96,6 +141,16 @@ public class DuoAPIAuthenticator implements Authenticator {
         MultivaluedMap<String, String> formData = authenticationFlowContext.getHttpRequest().getDecodedFormParameters();
         if (formData.containsKey("cancel")) {
             authenticationFlowContext.cancelLogin();
+            return;
+        }
+        if (formData.containsKey("restart")) {
+            authenticationFlowContext.getAuthenticationSession().clearAuthNotes();
+            authenticationFlowContext.resetFlow();
+            return;
+        }
+        if (formData.containsKey("resend")) {
+            authenticationFlowContext.getAuthenticationSession().clearAuthNotes();
+            authenticate(authenticationFlowContext);
             return;
         }
 
@@ -116,13 +171,17 @@ public class DuoAPIAuthenticator implements Authenticator {
             String sendTime = authenticationFlowContext.getAuthenticationSession().getAuthNote("duo-send-time");
             if (sendTime == null || sendTime.equalsIgnoreCase("")) {
                 //force expired
-                authenticationFlowContext.failure(AuthenticationFlowError.INVALID_CREDENTIALS);
+                challengePushForm(authenticationFlowContext, "The push request has expired!  Click try again to send another.");
                 return;
             }
-            long sendTimeLong = Long.getLong(sendTime);
-            if (Instant.now().getEpochSecond() - sendTimeLong > 20) {
-                //20 seconds to accept
-                authenticationFlowContext.failure(AuthenticationFlowError.INVALID_CREDENTIALS);
+            try {
+                long sendTimeLong = Long.parseLong(sendTime);
+                if (Instant.now().getEpochSecond() - sendTimeLong >= 60) {
+                    //60 seconds to accept
+                    throw new Exception("Push expired!");
+                }
+            } catch (Exception ex) {
+                challengePushForm(authenticationFlowContext, "The push request has expired!  Click try again to send another.");
                 return;
             }
 
@@ -134,19 +193,15 @@ public class DuoAPIAuthenticator implements Authenticator {
                     authenticationFlowContext.success();
                     return;
                 } else if (result.equalsIgnoreCase("deny")) {
-                    authenticationFlowContext.failure(AuthenticationFlowError.INVALID_CREDENTIALS);
+                    challengePushForm(authenticationFlowContext, "The push request was declined.");
                     return;
                 } else {
                     //waiting
-                    LoginFormsProvider form = authenticationFlowContext.form();
-                    Response response = form.createForm("duo-push.ftl");
-                    authenticationFlowContext.challenge(response);
+                    challengePushForm(authenticationFlowContext);
                     return;
                 }
             } catch (DuoRequestFailedException e) {
-                LoginFormsProvider form = authenticationFlowContext.form();
-                Response response = form.createForm("duo-push.ftl");
-                authenticationFlowContext.challenge(response);
+                challengePushForm(authenticationFlowContext);
                 return;
             }
         } else if (duoMethod.equalsIgnoreCase("code")) {
@@ -167,12 +222,7 @@ public class DuoAPIAuthenticator implements Authenticator {
                 authenticationFlowContext.success();
                 return;
             } else {
-                LoginFormsProvider form = authenticationFlowContext.form();
-                MultivaluedHashMap<String, String> newFormData = new MultivaluedHashMap<String, String>();
-                formData.add("duo-capability", duoCap);
-                Response response = form.setFormData(formData).createForm("duo-code.ftl");
-                authenticationFlowContext.failureChallenge(AuthenticationFlowError.INVALID_CREDENTIALS, response);
-                return;
+                challengeCodeForm(authenticationFlowContext, device.getCapabilityIdentifier(), "The provided passcode is not valid.");
             }
         } else {
             //unknown method attempted
