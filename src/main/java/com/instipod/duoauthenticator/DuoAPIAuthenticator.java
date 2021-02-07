@@ -63,6 +63,20 @@ public class DuoAPIAuthenticator implements Authenticator {
         challengeCodeForm(authenticationFlowContext, capability, null);
     }
 
+    private void handleCommError(AuthenticationFlowContext authenticationFlowContext, String message) {
+        boolean failSafe = authenticationFlowContext.getAuthenticatorConfig().getConfig().getOrDefault(DuoAPIAuthenticatorFactory.DUO_FAIL_SAFE, "false").equalsIgnoreCase("true");
+        if (failSafe) {
+            authenticationFlowContext.success();
+            return;
+        } else {
+            LoginFormsProvider provider = authenticationFlowContext.form();
+            provider.setError(message);
+            Response response = provider.createErrorPage(Response.Status.OK);
+            authenticationFlowContext.failureChallenge(AuthenticationFlowError.INTERNAL_ERROR, response);
+            return;
+        }
+    }
+
     @Override
     public void authenticate(AuthenticationFlowContext authenticationFlowContext) {
         AuthenticatorConfigModel config = authenticationFlowContext.getAuthenticatorConfig();
@@ -82,7 +96,12 @@ public class DuoAPIAuthenticator implements Authenticator {
         DuoAPIObject duo = getDuoObject(authenticationFlowContext.getAuthenticatorConfig());
 
         DuoUser duoUser = duo.getUser(authenticationFlowContext.getUser().getUsername(), authenticationFlowContext.getConnection().getRemoteAddr());
-        duoUser.refresh();
+        boolean refreshSuccess = duoUser.refresh();
+
+        if (!refreshSuccess) {
+            handleCommError(authenticationFlowContext, "Sorry, we are unable to retrieve your MFA options at this time!");
+            return;
+        }
 
         String defaultAction = duoUser.getDefaultAction();
         if (defaultAction.equalsIgnoreCase("allow")) {
@@ -114,21 +133,31 @@ public class DuoAPIAuthenticator implements Authenticator {
         preference[4] = "sms";
         DuoDevice device = duoUser.getFirstDevice(preference);
         if (device != null && device instanceof DuoPushCapableDevice) {
-            DuoPushCapableDevice pushDevice = (DuoPushCapableDevice)device;
-            DuoDelayedTransaction transaction = pushDevice.push(authenticationFlowContext.getUser().getUsername(), authenticationFlowContext.getAuthenticationSession().getClient().getName(), authenticationFlowContext.getConnection().getRemoteAddr());
-            authenticationFlowContext.getAuthenticationSession().setAuthNote("duo-method", "push");
-            authenticationFlowContext.getAuthenticationSession().setAuthNote("duo-send-time", Long.toString(Instant.now().getEpochSecond()));
-            authenticationFlowContext.getAuthenticationSession().setAuthNote("duo-transaction", transaction.getTransactionIdentifier());
-            challengePushForm(authenticationFlowContext);
-            return;
+            try {
+                DuoPushCapableDevice pushDevice = (DuoPushCapableDevice) device;
+                DuoDelayedTransaction transaction = pushDevice.push(authenticationFlowContext.getUser().getUsername(), authenticationFlowContext.getAuthenticationSession().getClient().getName(), authenticationFlowContext.getConnection().getRemoteAddr());
+                authenticationFlowContext.getAuthenticationSession().setAuthNote("duo-method", "push");
+                authenticationFlowContext.getAuthenticationSession().setAuthNote("duo-send-time", Long.toString(Instant.now().getEpochSecond()));
+                authenticationFlowContext.getAuthenticationSession().setAuthNote("duo-transaction", transaction.getTransactionIdentifier());
+                challengePushForm(authenticationFlowContext);
+                return;
+            } catch (Exception ex) {
+                handleCommError(authenticationFlowContext, "Sorry, we were unable to send a push to your device!");
+                return;
+            }
         } else if (device != null && device instanceof DuoCodeCapableDevice) {
-            DuoCodeCapableDevice codeDevice = (DuoCodeCapableDevice)device;
-            codeDevice.challenge(authenticationFlowContext.getUser().getUsername(), authenticationFlowContext.getConnection().getRemoteAddr());
-            authenticationFlowContext.getAuthenticationSession().setAuthNote("duo-method", "code");
-            authenticationFlowContext.getAuthenticationSession().setAuthNote("duo-device", device.getDeviceIdentifier());
-            authenticationFlowContext.getAuthenticationSession().setAuthNote("duo-capability", device.getCapabilityIdentifier());
-            challengeCodeForm(authenticationFlowContext, device.getCapabilityIdentifier());
-            return;
+            try {
+                DuoCodeCapableDevice codeDevice = (DuoCodeCapableDevice) device;
+                codeDevice.challenge(authenticationFlowContext.getUser().getUsername(), authenticationFlowContext.getConnection().getRemoteAddr());
+                authenticationFlowContext.getAuthenticationSession().setAuthNote("duo-method", "code");
+                authenticationFlowContext.getAuthenticationSession().setAuthNote("duo-device", device.getDeviceIdentifier());
+                authenticationFlowContext.getAuthenticationSession().setAuthNote("duo-capability", device.getCapabilityIdentifier());
+                challengeCodeForm(authenticationFlowContext, device.getCapabilityIdentifier());
+                return;
+            } catch (Exception ex) {
+                handleCommError(authenticationFlowContext, "Sorry, we were unable to send a code challenge!");
+                return;
+            }
         } else {
             //unsupported device type or no device
             authenticationFlowContext.attempted();
@@ -201,8 +230,14 @@ public class DuoAPIAuthenticator implements Authenticator {
                     return;
                 }
             } catch (DuoRequestFailedException e) {
-                challengePushForm(authenticationFlowContext);
-                return;
+                boolean failSafe = authenticationFlowContext.getAuthenticatorConfig().getConfig().getOrDefault(DuoAPIAuthenticatorFactory.DUO_FAIL_SAFE, "false").equalsIgnoreCase("true");
+                if (failSafe) {
+                    authenticationFlowContext.success();
+                    return;
+                } else {
+                    challengePushForm(authenticationFlowContext);
+                    return;
+                }
             }
         } else if (duoMethod.equalsIgnoreCase("code")) {
             String passcode = formData.getFirst("passcode");
@@ -217,12 +252,16 @@ public class DuoAPIAuthenticator implements Authenticator {
             //we have a passcode and data at this point
             DuoAPIObject duo = getDuoObject(authenticationFlowContext.getAuthenticatorConfig());
             DuoCodeCapableDevice device = new DuoCodeCapableDevice(duo, duoDevice, duoCap, duoDevice);
-            boolean result = device.checkResponse(authenticationFlowContext.getUser().getUsername(), authenticationFlowContext.getConnection().getRemoteAddr(), passcode);
-            if (result) {
-                authenticationFlowContext.success();
-                return;
-            } else {
-                challengeCodeForm(authenticationFlowContext, device.getCapabilityIdentifier(), "The provided passcode is not valid.");
+            try {
+                boolean result = device.checkResponse(authenticationFlowContext.getUser().getUsername(), authenticationFlowContext.getConnection().getRemoteAddr(), passcode);
+                if (result) {
+                    authenticationFlowContext.success();
+                    return;
+                } else {
+                    challengeCodeForm(authenticationFlowContext, device.getCapabilityIdentifier(), "The provided passcode is not valid.");
+                }
+            } catch (Exception ex) {
+                handleCommError(authenticationFlowContext, "Sorry, we are unable to check your passcodes at this time!");
             }
         } else {
             //unknown method attempted
