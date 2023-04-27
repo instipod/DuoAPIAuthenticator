@@ -1,4 +1,6 @@
 # DuoAPIAuthenticator
+**Use of this authenticator is no longer recommended.  Duo is recommending users migrate to the Duo Universal Prompt authentication flow instead of the Auth API.**
+
 Authenticator for [Keycloak](https://github.com/keycloak/keycloak) that uses Duo's Auth API to present a custom interface.  This allows the Keycloak administrator to create a custom authentication theme that fits with their flow.  
 
 The included FreeMarker templates are not designed for production use.  They are designed to be a basic example that you will extend with a custom Keycloak theme.
